@@ -8,6 +8,7 @@ import { Registry } from "./registry.js";
 import { discoverStored, readTranscript } from "./store.js";
 import { Advertiser } from "./advertiser.js";
 import { computeStats } from "./stats.js";
+import { listDirs, launchPi } from "./launch.js";
 import { lanAddresses, isLoopback } from "./net.js";
 import { PROTOCOL_VERSION } from "../../shared/protocol.js";
 import type { AppToBridge, BridgeToApp } from "../../shared/protocol.js";
@@ -118,6 +119,14 @@ export async function startServer(opts: ServerOptions): Promise<{ close: () => P
         case "stats":
           send(ws, { type: "stats", stats: await computeStats() });
           break;
+        case "listDirs":
+          send(ws, { type: "dirs", id: msg.id, listing: await listDirs(msg.path) });
+          break;
+        case "launch": {
+          const res = launchPi(msg.cwd);
+          send(ws, { type: "launched", id: msg.id, ok: res.ok, cwd: msg.cwd, error: res.error });
+          break;
+        }
         case "history": {
           // Prefer the full on-disk transcript, then append any live messages not
           // yet flushed to disk (matched by role + text since timestamps differ).

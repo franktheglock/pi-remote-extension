@@ -162,6 +162,8 @@ export type AppToBridge =
   | { type: "hello"; token: string; appVersion: string; deviceId?: string }
   | { type: "list" }                                  // request full snapshot
   | { type: "stats" }                                 // request usage stats
+  | { type: "listDirs"; id: string; path?: string }    // browse the filesystem
+  | { type: "launch"; id: string; cwd: string }        // start a new pi session
   | { type: "subscribe" }                             // request live updates
   | { type: "history"; sessionId: string; limit?: number }
   | {
@@ -196,6 +198,8 @@ export type BridgeToApp =
     }
   | { type: "history"; sessionId: string; messages: TranscriptMessage[] }
   | { type: "stats"; stats: StatsPayload }
+  | { type: "dirs"; id: string; listing: DirListing }
+  | { type: "launched"; id: string; ok: boolean; cwd: string; error?: string }
   | {
       // result of a `control` command, forwarded back to the requesting app
       type: "controlResult";
@@ -229,6 +233,22 @@ export interface StatsPayload {
   totals: { tokens: number; cost: number; messages: number; sessions: number; models: ModelUsage[] };
   periods: { today: PeriodStats; week: PeriodStats; month: PeriodStats; year: PeriodStats };
   generatedAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem browsing / launching
+// ---------------------------------------------------------------------------
+
+export interface DirEntry {
+  name: string;
+  path: string;
+}
+
+export interface DirListing {
+  path: string;
+  parent: string | null;
+  home: string;
+  dirs: DirEntry[];
 }
 
 // ---------------------------------------------------------------------------

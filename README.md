@@ -41,6 +41,29 @@ advertising, and shows a **QR code** + pairing card. Scan it (or enter the IP + 
 in the app. `/remote` subcommands: `status`, `pair`, `hide`, `advertise on|off`,
 `token`, `restart`.
 
+## Updating
+
+**As a pi package (recommended — makes `pi update --extensions` work):**
+
+```bash
+pi install git:github.com/franktheglock/pi-remote-extension
+# later, to update:
+pi update --extensions
+```
+
+**Manually (folder copy):**
+
+```bash
+cd pi-remote-extension && ./update.sh
+```
+
+> `pi update --extensions` only updates extensions that pi installed as *packages*
+> (npm/git). If you copied the folder into `~/.pi/agent/extensions/` by hand, pi
+> doesn't track it — use `update.sh` or re-copy the folder, then `/reload` in pi.
+
+The **bridge** is a separate Node process and is *not* managed by pi. Update/restart it
+with `cd bridge && git pull && npm install && npm run dev`.
+
 ## Platform support
 
 Plain Node.js, no native modules — runs on **macOS, Linux, and Windows**.
