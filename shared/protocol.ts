@@ -220,13 +220,13 @@ export interface PeriodStats {
   tokens: number;
   cost: number;
   messages: number;
+  models: ModelUsage[];
   topModel?: ModelUsage;
 }
 
 export interface StatsPayload {
-  totals: { tokens: number; cost: number; messages: number; sessions: number };
+  totals: { tokens: number; cost: number; messages: number; sessions: number; models: ModelUsage[] };
   periods: { today: PeriodStats; week: PeriodStats; month: PeriodStats; year: PeriodStats };
-  topModels: ModelUsage[];
   generatedAt: number;
 }
 

@@ -47,11 +47,16 @@ function addTo(acc: Acc, provider: string, model: string, tokens: number, cost: 
 }
 
 function topModel(acc: Acc): ModelUsage | undefined {
-  return [...acc.models.values()].sort((a, b) => b.tokens - a.tokens)[0];
+  return sortedModels(acc)[0];
+}
+
+function sortedModels(acc: Acc): ModelUsage[] {
+  return [...acc.models.values()].sort((a, b) => b.tokens - a.tokens);
 }
 
 function toPeriod(acc: Acc): PeriodStats {
-  return { tokens: acc.tokens, cost: acc.cost, messages: acc.messages, topModel: topModel(acc) };
+  const models = sortedModels(acc);
+  return { tokens: acc.tokens, cost: acc.cost, messages: acc.messages, models, topModel: models[0] };
 }
 
 function num(v: unknown): number {
@@ -126,14 +131,19 @@ export async function computeStats(ttlMs = 60_000): Promise<StatsPayload> {
   }
 
   const data: StatsPayload = {
-    totals: { tokens: all.tokens, cost: all.cost, messages: all.messages, sessions: files.length },
+    totals: {
+      tokens: all.tokens,
+      cost: all.cost,
+      messages: all.messages,
+      sessions: files.length,
+      models: sortedModels(all),
+    },
     periods: {
       today: toPeriod(accToday),
       week: toPeriod(accWeek),
       month: toPeriod(accMonth),
       year: toPeriod(accYear),
     },
-    topModels: [...all.models.values()].sort((a, b) => b.tokens - a.tokens).slice(0, 8),
     generatedAt: Date.now(),
   };
   cache = { at: Date.now(), data };
