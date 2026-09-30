@@ -15,6 +15,12 @@ export interface DirListing {
   dirs: DirEntry[];
 }
 
+export interface LaunchResult {
+  ok: boolean;
+  mode?: string;
+  error?: string;
+}
+
 /** List subdirectories of `input` (defaults to $HOME) for the folder picker. */
 export async function listDirs(input?: string): Promise<DirListing> {
   const home = os.homedir();
@@ -41,60 +47,92 @@ export async function listDirs(input?: string): Promise<DirListing> {
   return { path: target, parent, home, dirs };
 }
 
-/** Where the pi binary lives; overridable with PI_REMOTE_PI_CMD. */
+/** The pi command; overridable with PI_REMOTE_PI_CMD (e.g. an absolute path). */
 function piCommand(): string {
   return process.env.PI_REMOTE_PI_CMD ?? "pi";
 }
 
 /**
- * Start a new pi session in `cwd`. On a desktop we open a real terminal window
- * (pi is a TUI); otherwise we fall back to tmux / a detached process. Best-effort.
+ * Start a new pi session in `cwd`.
+ *
+ * pi is a TUI, so we open a real terminal when there's a desktop session. On a
+ * headless box (or over SSH) we prefer **tmux**, which works without a display.
+ * Each candidate is actually probed, and we report a real error if none work.
  */
-export function launchPi(cwd: string): { ok: boolean; error?: string } {
+export async function launchPi(cwd: string): Promise<LaunchResult> {
   const dir = resolve(cwd && cwd.trim() ? cwd : os.homedir());
   const cmd = piCommand();
+  const run = `cd ${shq(dir)} && exec ${cmd}`;
 
-  try {
-    if (process.platform === "darwin") {
-      const script = `cd ${shq(dir)} && exec ${cmd}`;
-      spawn("osascript", ["-e", `tell application "Terminal" to do script ${asq(script)}`, "-e", `tell application "Terminal" to activate`], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      return { ok: true };
-    }
+  if (process.platform === "darwin") {
+    const script = `cd ${shq(dir)} && exec ${cmd}`;
+    return trySpawn(
+      "osascript",
+      ["-e", `tell application "Terminal" to do script ${asq(script)}`, "-e", `tell application "Terminal" to activate`],
+      {},
+      "terminal"
+    );
+  }
 
-    if (process.platform === "win32") {
-      spawn("cmd", ["/c", "start", "", "cmd", "/k", `cd /d "${dir}" && ${cmd}`], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-      return { ok: true };
-    }
+  if (process.platform === "win32") {
+    return trySpawn("cmd", ["/c", "start", "", "cmd", "/k", `cd /d "${dir}" && ${cmd}`], {}, "terminal");
+  }
 
-    // Linux / other: prefer a graphical terminal, else tmux, else detached.
-    const inner = `cd ${shq(dir)} && exec ${cmd}`;
+  // Linux / other.
+
+  // 1) tmux — works headless / over SSH. Try an existing server, else start one.
+  if (hasBinary("tmux")) {
+    const name = `pi-remote-${Date.now().toString(36)}`;
+    const r = await trySpawn("tmux", ["new-session", "-d", "-s", name, "-c", dir, `bash -lc ${shq(`exec ${cmd}`)}`], {}, "tmux");
+    if (r.ok) return r;
+  }
+
+  // 2) A graphical terminal, if a display is available.
+  if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
     const terminals: [string, string[]][] = [
-      ["x-terminal-emulator", ["-e", "bash", "-lc", inner]],
-      ["gnome-terminal", ["--", "bash", "-lc", inner]],
-      ["konsole", ["-e", "bash", "-lc", inner]],
-      ["xterm", ["-e", "bash", "-lc", inner]],
+      ["x-terminal-emulator", ["-e", "bash", "-lc", run]],
+      ["gnome-terminal", ["--", "bash", "-lc", run]],
+      ["konsole", ["-e", "bash", "-lc", run]],
+      ["xfce4-terminal", ["-e", `bash -lc ${shq(run)}`]],
+      ["xterm", ["-e", "bash", "-lc", run]],
     ];
     for (const [bin, args] of terminals) {
       if (hasBinary(bin)) {
-        spawn(bin, args, { detached: true, stdio: "ignore" }).unref();
-        return { ok: true };
+        const r = await trySpawn(bin, args, {}, "terminal");
+        if (r.ok) return r;
       }
     }
-    if (hasBinary("tmux")) {
-      spawn("tmux", ["new-session", "-d", "-c", dir, cmd], { detached: true, stdio: "ignore" }).unref();
-      return { ok: true };
-    }
-    spawn(cmd, [], { cwd: dir, detached: true, stdio: "ignore" }).unref();
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
   }
+
+  // 3) Detached, best effort (a TUI without a tty may not render).
+  return trySpawn(cmd, [], { cwd: dir }, "detached");
+}
+
+function trySpawn(bin: string, args: string[], opts: any, mode: string): Promise<LaunchResult> {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, args, { detached: true, stdio: "ignore", ...opts });
+    } catch (err) {
+      resolvePromise({ ok: false, mode, error: (err as Error).message });
+      return;
+    }
+    child.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        resolvePromise({ ok: false, mode, error: err.message });
+      }
+    });
+    child.unref();
+    // No 'error' within a moment → treat as launched.
+    setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolvePromise({ ok: true, mode });
+      }
+    }, 600);
+  });
 }
 
 function hasBinary(name: string): boolean {

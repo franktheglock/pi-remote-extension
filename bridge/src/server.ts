@@ -123,8 +123,8 @@ export async function startServer(opts: ServerOptions): Promise<{ close: () => P
           send(ws, { type: "dirs", id: msg.id, listing: await listDirs(msg.path) });
           break;
         case "launch": {
-          const res = launchPi(msg.cwd);
-          send(ws, { type: "launched", id: msg.id, ok: res.ok, cwd: msg.cwd, error: res.error });
+          const res = await launchPi(msg.cwd);
+          send(ws, { type: "launched", id: msg.id, ok: res.ok, cwd: msg.cwd, error: res.error, mode: res.mode });
           break;
         }
         case "history": {
