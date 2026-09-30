@@ -154,6 +154,19 @@ export class Registry extends EventEmitter {
         });
         break;
       }
+      case "ask": {
+        const client = this.extBySocket.get(socket);
+        if (!client) return;
+        this.broadcast({
+          type: "ask",
+          sessionId: client.extSessionKey,
+          id: msg.id,
+          question: msg.question,
+          options: msg.options,
+          allowCustom: msg.allowCustom,
+        });
+        break;
+      }
       case "command_result": {
         const client = this.extBySocket.get(socket);
         if (!client) return;
@@ -221,12 +234,33 @@ export class Registry extends EventEmitter {
 
   addApp(socket: Socket): void {
     this.apps.add(socket);
-    socket.on("close", () => this.apps.delete(socket));
-    socket.on("error", () => this.apps.delete(socket));
+    socket.on("close", () => {
+      this.apps.delete(socket);
+      this.broadcastPeers();
+    });
+    socket.on("error", () => {
+      this.apps.delete(socket);
+      this.broadcastPeers();
+    });
+    this.broadcastPeers();
   }
 
   removeApp(socket: Socket): void {
     this.apps.delete(socket);
+    this.broadcastPeers();
+  }
+
+  private broadcastPeers(): void {
+    for (const client of this.extBySocket.values()) {
+      this.send(client.socket, { type: "peers", apps: this.apps.size });
+    }
+  }
+
+  /** Deliver the app's answer to the extension that asked. */
+  sendAnswer(sessionId: string, id: string, index?: number, label?: string, custom?: string): void {
+    const client = this.extBySession.get(sessionId);
+    if (!client) return;
+    this.send(client.socket, { type: "answer", askId: id, index, label, custom });
   }
 
   appCount(): number {

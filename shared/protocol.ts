@@ -120,6 +120,14 @@ export type ExtToBridge =
       body: string;
     }
   | {
+      type: "ask"; // a question the app can ANSWER (from the `ask` tool)
+      sessionId: string;
+      id: string;
+      question: string;
+      options: { label: string; description?: string }[];
+      allowCustom?: boolean;
+    }
+  | {
       type: "command_result";
       id: string;
       ok: boolean;
@@ -133,6 +141,8 @@ export type ExtToBridge =
 
 export type BridgeToExt =
   | { type: "hello"; serverVersion: string; registered: boolean }
+  | { type: "peers"; apps: number }
+  | { type: "answer"; askId: string; index?: number; label?: string; custom?: string }
   | {
       type: "command";
       id: string;
@@ -162,6 +172,14 @@ export type AppToBridge =
   | { type: "hello"; token: string; appVersion: string; deviceId?: string }
   | { type: "list" }                                  // request full snapshot
   | { type: "stats" }                                 // request usage stats
+  | {
+      type: "answer"; // answer a pending `ask`
+      sessionId: string;
+      id: string;
+      index?: number;
+      label?: string;
+      custom?: string;
+    }
   | { type: "listDirs"; id: string; path?: string }    // browse the filesystem
   | { type: "launch"; id: string; cwd: string }        // start a new pi session
   | { type: "subscribe" }                             // request live updates
@@ -200,6 +218,14 @@ export type BridgeToApp =
   | { type: "stats"; stats: StatsPayload }
   | { type: "dirs"; id: string; listing: DirListing }
   | { type: "launched"; id: string; ok: boolean; cwd: string; error?: string }
+  | {
+      type: "ask";
+      sessionId: string;
+      id: string;
+      question: string;
+      options: { label: string; description?: string }[];
+      allowCustom?: boolean;
+    }
   | {
       // result of a `control` command, forwarded back to the requesting app
       type: "controlResult";

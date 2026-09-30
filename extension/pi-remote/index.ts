@@ -4,6 +4,7 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { Type } from "typebox";
 
 /**
  * Pi Remote — pi extension.
@@ -90,6 +91,8 @@ let streamedBuffer = "";
 let currentAssistantText = "";
 let currentAssistantThinking = "";
 const toolArgsById = new Map<string, any>();
+let appCount = 0;
+const pendingAsks = new Map<string, (answer: any) => void>();
 let lastCtxCapture = "";
 
 type RuntimeState = "starting" | "idle" | "streaming" | "waiting_input" | "compacting";
@@ -234,6 +237,53 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact", async (_e, ctx) => setState("idle", ctx));
   pi.on("session_before_compact", async (_e, ctx) => setState("compacting", ctx));
 
+  // ---- remote question tool ----
+  pi.registerTool({
+    name: "ask",
+    label: "Ask",
+    description:
+      "Ask the user a question with predefined options. Delivered to the Pi Remote phone app when connected; otherwise prompts in the terminal.",
+    promptSnippet: "Ask the user a multiple-choice question (reaches the Pi Remote phone app)",
+    promptGuidelines: [
+      "Use ask (not question) to ask the user a question when you need their input; it reaches them on the Pi Remote phone app.",
+    ],
+    parameters: Type.Object({
+      question: Type.String({ description: "The question to ask" }),
+      options: Type.Array(
+        Type.Object({
+          label: Type.String({ description: "Choice label" }),
+          description: Type.Optional(Type.String({ description: "Optional detail" })),
+        }),
+        { description: "Choices for the user" }
+      ),
+    }),
+    async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+      const question = String(params?.question ?? "");
+      const options = (params?.options ?? []) as { label: string; description?: string }[];
+
+      if (appCount > 0) {
+        const askId = `ask-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+        const answer = await new Promise<any>((resolve) => {
+          pendingAsks.set(askId, resolve);
+          sendRaw({ type: "ask", sessionId: sessionId(), id: askId, question, options, allowCustom: true });
+          setTimeout(() => {
+            if (pendingAsks.delete(askId)) resolve(null);
+          }, 10 * 60_000);
+        });
+        if (answer) {
+          const text = answer.custom
+            ? String(answer.custom)
+            : answer.label ?? options[answer.index ?? -1]?.label ?? "";
+          return { content: [{ type: "text", text }], details: answer };
+        }
+      }
+
+      // Fallback: terminal prompt.
+      const choice = await ctx.ui.select(question, options.map((o) => o.label));
+      return { content: [{ type: "text", text: choice ?? "User cancelled." }], details: {} };
+    },
+  });
+
   // ---- slash command ----
   pi.registerCommand("remote", {
     description:
@@ -292,6 +342,14 @@ function connect(): void {
     }
     if (msg?.type === "command") {
       void handleCommand(msg);
+    } else if (msg?.type === "peers") {
+      appCount = typeof msg.apps === "number" ? msg.apps : 0;
+    } else if (msg?.type === "answer") {
+      const resolve = pendingAsks.get(msg.askId);
+      if (resolve) {
+        pendingAsks.delete(msg.askId);
+        resolve({ index: msg.index, label: msg.label, custom: msg.custom });
+      }
     } else if (msg?.type === "ping") {
       sendRaw({ type: "status", ...statusFields() });
     }

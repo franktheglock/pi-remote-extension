@@ -119,6 +119,9 @@ export async function startServer(opts: ServerOptions): Promise<{ close: () => P
         case "stats":
           send(ws, { type: "stats", stats: await computeStats() });
           break;
+        case "answer":
+          registry.sendAnswer(msg.sessionId, msg.id, msg.index, msg.label, msg.custom);
+          break;
         case "listDirs":
           send(ws, { type: "dirs", id: msg.id, listing: await listDirs(msg.path) });
           break;

@@ -75,7 +75,16 @@ export async function launchPi(cwd: string): Promise<LaunchResult> {
   }
 
   if (process.platform === "win32") {
-    return trySpawn("cmd", ["/c", "start", "", "cmd", "/k", `cd /d "${dir}" && ${cmd}`], {}, "terminal");
+    // Node's default argv quoting escapes inner quotes as \" which cmd.exe
+    // doesn't understand ("syntax is incorrect"), so pass the command line
+    // verbatim. `start /D` sets the new window's folder — no `cd` needed.
+    // `"pi"` is the window title (start treats its first quoted arg as one).
+    return trySpawn(
+      "cmd.exe",
+      ["/d", "/c", "start", `"pi"`, "/D", `"${dir}"`, "cmd.exe", "/k", cmd],
+      { cwd: dir, windowsVerbatimArguments: true, windowsHide: true },
+      "terminal"
+    );
   }
 
   // Linux / other.
