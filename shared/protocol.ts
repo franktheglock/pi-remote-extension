@@ -70,6 +70,7 @@ export interface TranscriptMessage {
   toolName?: string;    // for toolResult / tool activity rows
   toolCallId?: string;  // correlates a tool call's start & end
   toolLabel?: string;   // primary detail: command / path / query / url
+  toolArgs?: string;    // full arguments (pretty JSON or the command)
   filePath?: string;    // full path for edit/write/read
   diff?: string;        // unified diff (edit/write) when available
   isError?: boolean;

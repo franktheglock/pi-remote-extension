@@ -122,6 +122,7 @@ export async function readTranscript(
   if (!match) return { messages: [], meta: {} };
   const text = await readFile(match.file, "utf8");
   const messages: any[] = [];
+  const toolArgsById = new Map<string, string>();
   let meta: { cwd?: string; name?: string } = {};
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
@@ -135,14 +136,37 @@ export async function readTranscript(
       meta = { cwd: obj.cwd, name: obj.name ?? obj.sessionName };
       continue;
     }
-    const mapped = entryToTranscript(obj);
+    collectToolArgs(obj, toolArgsById);
+    const mapped = entryToTranscript(obj, toolArgsById);
     if (mapped) messages.push(mapped);
   }
   return { messages: messages.slice(-limit), meta };
 }
 
+/** Record tool-call arguments keyed by toolCallId (assistant entries precede results). */
+function collectToolArgs(obj: any, map: Map<string, string>): void {
+  if (obj?.type !== "message") return;
+  const m = obj.message;
+  if (m?.role !== "assistant" || !Array.isArray(m.content)) return;
+  for (const part of m.content) {
+    if ((part?.type === "toolCall" || part?.type === "toolUse" || part?.type === "tool_use") && typeof part.id === "string") {
+      const args = part.arguments ?? part.input ?? part.args;
+      let display: string | undefined;
+      if (args && typeof args === "object" && typeof args.command === "string") display = args.command;
+      else if (args !== undefined) {
+        try {
+          display = JSON.stringify(args, null, 2);
+        } catch {
+          display = undefined;
+        }
+      }
+      if (display) map.set(part.id, display.length > 8000 ? display.slice(0, 8000) : display);
+    }
+  }
+}
+
 /** Map a pi session entry to a transport TranscriptMessage (best-effort). */
-export function entryToTranscript(obj: any): any | null {
+export function entryToTranscript(obj: any, toolArgsById?: Map<string, string>): any | null {
   if (!obj) return null;
 
   // pi session entries look like: { type: "message", id, parentId, timestamp, message: {...} }
@@ -155,7 +179,7 @@ export function entryToTranscript(obj: any): any | null {
   }
 
   const tsRaw = m.timestamp ?? obj.timestamp;
-  const ts = tsRaw ? Date.parse(tsRaw) : undefined;
+  const ts = typeof tsRaw === "number" ? tsRaw : Date.parse(typeof tsRaw === "string" ? tsRaw : "");
 
   return {
     role,
@@ -164,6 +188,7 @@ export function entryToTranscript(obj: any): any | null {
     timestamp: Number.isFinite(ts) ? ts : undefined,
     toolName: m.toolName,
     toolCallId: m.toolCallId,
+    toolArgs: m.toolCallId ? toolArgsById?.get(m.toolCallId) : undefined,
     filePath: typeof m.path === "string" ? m.path : undefined,
     diff: typeof m.details?.diff === "string" ? m.details.diff : undefined,
     isError: m.isError,

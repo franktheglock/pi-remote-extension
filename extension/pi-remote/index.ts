@@ -182,6 +182,7 @@ export default function (pi: ExtensionAPI) {
       toolName: event.toolName,
       toolCallId: event.toolCallId,
       toolLabel: toolLabel(event.toolName, event.args),
+      toolArgs: argsDisplay(event.toolName, event.args),
       filePath: pathOf(event.args),
       toolState: "running",
       text: "",
@@ -199,6 +200,7 @@ export default function (pi: ExtensionAPI) {
       toolName: event.toolName,
       toolCallId: event.toolCallId,
       toolLabel: toolLabel(event.toolName, args),
+      toolArgs: argsDisplay(event.toolName, args),
       filePath: pathOf(args),
       toolState: "done",
       isError: !!event.isError,
@@ -677,6 +679,17 @@ function pathOf(args: any): string | undefined {
   if (typeof args.path === "string") return args.path;
   if (typeof args.file_path === "string") return args.file_path;
   return undefined;
+}
+
+/** Full tool arguments as a readable string (command for bash, pretty JSON else). */
+function argsDisplay(name: string, args: any): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  if (typeof args.command === "string") return truncate(args.command, 8000);
+  try {
+    return truncate(JSON.stringify(args, null, 2), 8000);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Prefer pi's own diff (edit) else synthesize one (write). */
