@@ -1,0 +1,949 @@
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+
+/**
+ * Pi Remote — pi extension.
+ *
+ * Runs inside every pi session and turns it into something the Pi Remote iPhone
+ * app can discover and control:
+ *
+ *  • connects to the local Pi Remote bridge (`pi-remote-bridge`) and streams live
+ *    status, messages, and tool activity to it;
+ *  • accepts inbound commands from the app: chat (prompt / steer / followUp),
+ *    abort, model switching, thinking level, rename;
+ *  • emits notifications when a session COMPLETES (agent_settled) or NEEDS INPUT
+ *    (a blocking UI prompt / confirmation is open);
+ *  • provides the `/remote` slash command that advertises this computer (via the
+ *    bridge) and prints a QR code so the iPhone app can pair in one scan.
+ *
+ * Install: copy `extension/pi-remote/` into `~/.pi/agent/extensions/pi-remote/`
+ * and run `npm install` inside it, then start `pi-remote-bridge` once (the
+ * `/remote` command will also auto-start it for you).
+ */
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const BRIDGE_HTTP = process.env.PI_REMOTE_BRIDGE ?? "http://127.0.0.1:8877";
+const BRIDGE_WS = BRIDGE_HTTP.replace(/^http/, "ws").replace(/\/$/, "") + "/ext";
+const HEARTBEAT_MS = 15_000;
+const APPEND_THROTTLE_MS = 350;
+
+// ---------------------------------------------------------------------------
+// Debug logging (best-effort; trims itself when large)
+// ---------------------------------------------------------------------------
+
+function debug(line: string): void {
+  try {
+    const dir = process.env.PI_REMOTE_HOME ?? `${process.env.HOME ?? "."}/.pi-remote`;
+    const path = `${dir}/ext.log`;
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      /* exists */
+    }
+    try {
+      if (statSync(path).size > 256 * 1024) writeFileSync(path, "");
+    } catch {
+      /* missing */
+    }
+    appendFileSync(path, `[${new Date().toISOString()}] pid=${process.pid} ${line}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime state
+// ---------------------------------------------------------------------------
+
+let runtime: ExtensionAPI | null = null;
+let runtimeCtx: ExtensionContext | null = null;
+
+interface BridgeConn {
+  ws: WebSocket | null;
+  connected: boolean;
+  reconnectTimer: NodeJS.Timeout | null;
+  heartbeat: NodeJS.Timeout | null;
+  intentionalClose: boolean;
+}
+
+const conn: BridgeConn = {
+  ws: null,
+  connected: false,
+  reconnectTimer: null,
+  heartbeat: null,
+  intentionalClose: false,
+};
+
+let currentState: RuntimeState = "starting";
+let prevState: RuntimeState = "idle";
+let startedAt = Date.now();
+let lastAppendAt = 0;
+let pendingAppend: NodeJS.Timeout | null = null;
+let streamedBuffer = "";
+let currentAssistantText = "";
+let currentAssistantThinking = "";
+const toolArgsById = new Map<string, any>();
+let lastCtxCapture = "";
+
+type RuntimeState = "starting" | "idle" | "streaming" | "waiting_input" | "compacting";
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  runtime = pi;
+
+  // ---- lifecycle ----
+  pi.on("session_start", async (_event, ctx) => {
+    runtimeCtx = ctx;
+    startedAt = Date.now();
+    setState("idle", ctx);
+    connect();
+  });
+
+  // resources_discover fires on startup AND on /reload, so this guarantees the
+  // extension connects even when it is loaded into an already-running session.
+  pi.on("resources_discover", async (_event, ctx) => {
+    if (ctx) runtimeCtx = ctx as ExtensionContext;
+    connect();
+    return {};
+  });
+
+  pi.on("session_shutdown", async () => {
+    conn.intentionalClose = true;
+    teardownSocket();
+  });
+
+  pi.on("session_info_changed", async (event, ctx) => {
+    pushStatus(ctx, { name: event.name });
+  });
+
+  // ---- agent activity -> streaming status + message stream ----
+  pi.on("agent_start", async (_e, ctx) => {
+    runtimeCtx = ctx;
+    streamedBuffer = "";
+    currentAssistantText = "";
+    currentAssistantThinking = "";
+    debug("agent_start");
+    setState("streaming", ctx);
+  });
+
+  pi.on("message_update", async (event, ctx) => {
+    runtimeCtx = ctx;
+    const m: any = event.message;
+    if (m?.role !== "assistant") return;
+    // Send the FULL current assistant text + thinking; the app replaces (upserts)
+    // the streaming message. Robust to any delta-event shape, and lets thinking
+    // stream live even before any text is produced.
+    const full = textOf(m);
+    const thinking = thinkingOf(m) ?? "";
+    if (full === currentAssistantText && thinking === currentAssistantThinking) return;
+    currentAssistantText = full;
+    currentAssistantThinking = thinking;
+    streamedBuffer = full;
+    scheduleAppend();
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    runtimeCtx = ctx;
+    const m: any = event.message;
+    if (!m) return;
+    debug(`message_end role=${m.role} len=${(textOf(m) || "").length}`);
+    if (m.role === "assistant") {
+      flushAppend();
+      sendMessage({
+        role: "assistant",
+        text: textOf(m),
+        thinking: thinkingOf(m),
+        timestamp: Date.now(),
+      });
+      streamedBuffer = "";
+      currentAssistantText = "";
+      currentAssistantThinking = "";
+    } else if (m.role === "user") {
+      sendMessage({ role: "user", text: textOf(m), timestamp: Date.now() });
+    }
+  });
+
+  pi.on("tool_execution_start", async (event, ctx) => {
+    runtimeCtx = ctx;
+    debug(`tool_start ${event.toolName}`);
+    toolArgsById.set(event.toolCallId, event.args);
+    sendMessage({
+      role: "toolResult",
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      toolLabel: toolLabel(event.toolName, event.args),
+      filePath: pathOf(event.args),
+      toolState: "running",
+      text: "",
+      timestamp: Date.now(),
+    });
+  });
+
+  pi.on("tool_execution_end", async (event, ctx) => {
+    runtimeCtx = ctx;
+    debug(`tool_end ${event.toolName} err=${!!event.isError}`);
+    const args = toolArgsById.get(event.toolCallId);
+    toolArgsById.delete(event.toolCallId);
+    sendMessage({
+      role: "toolResult",
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      toolLabel: toolLabel(event.toolName, args),
+      filePath: pathOf(args),
+      toolState: "done",
+      isError: !!event.isError,
+      diff: diffFor(event.toolName, args, event.result),
+      text: summarizeTool(event),
+      timestamp: Date.now(),
+    });
+  });
+
+  // ---- completion / needs-input notifications ----
+  pi.on("agent_settled", async (_e, ctx) => {
+    runtimeCtx = ctx;
+    debug("agent_settled");
+    setState("idle", ctx);
+    notify("complete", "Session complete", preview(ctx) || "The agent finished and is idle.");
+  });
+
+  pi.on("ui_prompt_start", async (event, ctx) => {
+    runtimeCtx = ctx;
+    prevState = currentState;
+    setState("waiting_input", ctx);
+    const label = event.title || kindLabel(event.kind);
+    notify("needs-input", "Needs your input", `${label} is waiting for a response.`);
+  });
+
+  pi.on("ui_prompt_end", async (_e, ctx) => {
+    runtimeCtx = ctx;
+    setState(prevState === "waiting_input" ? "idle" : prevState, ctx);
+  });
+
+  pi.on("session_compact", async (_e, ctx) => setState("idle", ctx));
+  pi.on("session_before_compact", async (_e, ctx) => setState("compacting", ctx));
+
+  // ---- slash command ----
+  pi.registerCommand("remote", {
+    description:
+      "Pi Remote: advertise this computer & show a QR to pair the iPhone app. /remote [pair|status|hide|advertise on|off|token|restart]",
+    handler: async (args, ctx) => {
+      runtimeCtx = ctx;
+      await remoteCommand(args ?? "", ctx);
+    },
+  });
+
+  // Cleanup on process exit.
+  process.on("exit", teardownSocket);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket connection to the bridge
+// ---------------------------------------------------------------------------
+
+function connect(): void {
+  if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  conn.intentionalClose = false;
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(BRIDGE_WS);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+  conn.ws = ws;
+
+  ws.addEventListener("open", () => {
+    conn.connected = true;
+    debug(`connected ${BRIDGE_WS}`);
+    if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+    sendRaw({
+      type: "register",
+      sessionId: sessionId(),
+      pid: process.pid,
+      cwd: runtimeCtx?.cwd ?? process.cwd(),
+      name: runtime?.getSessionName?.() ?? undefined,
+      model: modelLabel(),
+      startedAt,
+    });
+    pushStatus(runtimeCtx, {});
+    startHeartbeat();
+  });
+
+  ws.addEventListener("message", (ev: MessageEvent) => {
+    let msg: any;
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      return;
+    }
+    if (msg?.type === "command") {
+      void handleCommand(msg);
+    } else if (msg?.type === "ping") {
+      sendRaw({ type: "status", ...statusFields() });
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    conn.connected = false;
+    debug("socket closed");
+    if (!conn.intentionalClose) scheduleReconnect();
+  });
+
+  ws.addEventListener("error", () => {
+    debug("socket error");
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+function scheduleReconnect(): void {
+  if (conn.intentionalClose) return;
+  if (conn.reconnectTimer) return;
+  conn.reconnectTimer = setTimeout(() => {
+    conn.reconnectTimer = null;
+    connect();
+  }, 3000);
+}
+
+function startHeartbeat(): void {
+  if (conn.heartbeat) clearInterval(conn.heartbeat);
+  conn.heartbeat = setInterval(() => void heartbeatTick(), HEARTBEAT_MS);
+}
+
+async function heartbeatTick(): Promise<void> {
+  if (conn.connected) sendRaw({ type: "status", ...statusFields() });
+  // The socket can silently go stale (e.g. after the bridge restarts) without
+  // firing a close event, so verify the bridge is actually reachable.
+  try {
+    const res = await fetch(`${BRIDGE_HTTP}/health`, { signal: AbortSignal.timeout(4000) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+  } catch {
+    debug("health check failed — reconnecting");
+    const old = conn.ws;
+    conn.ws = null;
+    conn.connected = false;
+    try {
+      old?.close();
+    } catch {
+      /* ignore */
+    }
+    if (!conn.reconnectTimer) connect();
+  }
+}
+
+function teardownSocket(): void {
+  if (conn.heartbeat) clearInterval(conn.heartbeat);
+  if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+  if (pendingAppend) clearTimeout(pendingAppend);
+  conn.heartbeat = null;
+  conn.reconnectTimer = null;
+  pendingAppend = null;
+  try {
+    conn.ws?.close();
+  } catch {
+    /* ignore */
+  }
+  conn.ws = null;
+  conn.connected = false;
+}
+
+function sendRaw(obj: unknown): void {
+  if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+    try {
+      conn.ws.send(JSON.stringify(obj));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound reporting helpers
+// ---------------------------------------------------------------------------
+
+function statusFields(): Record<string, unknown> {
+  return {
+    type: "status",
+    state: currentState,
+    model: modelLabel(),
+    provider: (runtimeCtx?.model as any)?.provider,
+    thinkingLevel: runtime?.getThinkingLevel?.() ?? runtimeCtx?.thinkingLevel,
+    thinkingLevels: thinkingLevelsFor(runtimeCtx),
+    isStreaming: currentState === "streaming",
+    updatedAt: Date.now(),
+  };
+}
+
+function pushStatus(ctx: ExtensionContext | null, extra: Record<string, unknown>): void {
+  sendRaw({ ...statusFields(), ...extra });
+  if (ctx && runtime?.getSessionName?.()) {
+    /* name already included via modelLabel fields when present */
+  }
+}
+
+function setState(
+  next: RuntimeState,
+  ctx?: ExtensionContext
+): void {
+  currentState = next;
+  if (ctx) runtimeCtx = ctx;
+  pushStatus(runtimeCtx ?? null, {});
+}
+
+function sendMessage(message: Record<string, unknown>): void {
+  sendRaw({ type: "message", sessionId: sessionId(), message });
+}
+
+function scheduleAppend(): void {
+  const now = Date.now();
+  if (now - lastAppendAt >= APPEND_THROTTLE_MS) {
+    flushAppend();
+  } else if (!pendingAppend) {
+    pendingAppend = setTimeout(() => {
+      pendingAppend = null;
+      flushAppend();
+    }, APPEND_THROTTLE_MS);
+  }
+}
+
+function flushAppend(): void {
+  if (pendingAppend) {
+    clearTimeout(pendingAppend);
+    pendingAppend = null;
+  }
+  if (currentAssistantText || currentAssistantThinking) {
+    sendRaw({
+      type: "append",
+      sessionId: sessionId(),
+      text: currentAssistantText,
+      thinking: currentAssistantThinking || undefined,
+    });
+    lastAppendAt = Date.now();
+  }
+}
+
+function notify(kind: "complete" | "needs-input" | "error" | "info", title: string, body: string): void {
+  sendRaw({ type: "notify", sessionId: sessionId(), kind, title, body });
+}
+
+// ---------------------------------------------------------------------------
+// Inbound command handling (from the iPhone app, via the bridge)
+// ---------------------------------------------------------------------------
+
+async function handleCommand(msg: { id: string; action: string; payload?: Record<string, unknown> }): Promise<void> {
+  const id = msg.id;
+  const p = msg.payload ?? {};
+  debug(`cmd ${msg.action}`);
+  try {
+    const data = await executeAction(msg.action, p);
+    sendRaw({ type: "command_result", id, ok: true, data });
+  } catch (err: any) {
+    sendRaw({ type: "command_result", id, ok: false, error: String(err?.message ?? err) });
+  }
+}
+
+async function executeAction(action: string, p: Record<string, unknown>): Promise<Record<string, unknown> | undefined> {
+  const pi = runtime!;
+  const ctx = runtimeCtx;
+  switch (action) {
+    case "prompt":
+    case "steer":
+    case "followUp": {
+      const text = String(p.text ?? p.message ?? "");
+      const rawImages = Array.isArray((p as any).images) ? ((p as any).images as any[]) : [];
+      const images = rawImages
+        .filter((im) => im && typeof im.data === "string" && im.data.length > 0)
+        .map((im) => ({
+          type: "image" as const,
+          data: im.data,
+          mimeType: typeof im.mimeType === "string" ? im.mimeType : "image/jpeg",
+        }));
+      if (!text && images.length === 0) throw new Error("empty message");
+      const streaming = ctx ? !ctx.isIdle() : currentState === "streaming";
+      let deliverAs: "steer" | "followUp" | undefined;
+      if (action === "steer") deliverAs = "steer";
+      else if (action === "followUp") deliverAs = "followUp";
+      else if (streaming) deliverAs = (p.deliverAs as any) === "followUp" ? "followUp" : "steer";
+      const content: any = images.length
+        ? [...(text ? [{ type: "text", text }] : []), ...images]
+        : text;
+      const opts: any = { expandPromptTemplates: true };
+      if (deliverAs) opts.deliverAs = deliverAs;
+      await pi.sendUserMessage(content, opts);
+      return { delivered: deliverAs ?? "immediate" };
+    }
+    case "abort": {
+      ctx?.abort();
+      return { ok: true };
+    }
+    case "setName": {
+      const name = String(p.name ?? "");
+      if (name) pi.setSessionName(name);
+      return { name: pi.getSessionName?.() ?? name };
+    }
+    case "setThinkingLevel": {
+      const level = String(p.level ?? "medium") as any;
+      pi.setThinkingLevel(level);
+      return { level: pi.getThinkingLevel?.() ?? level };
+    }
+    case "getAvailableThinkingLevels": {
+      return { levels: thinkingLevelsFor(ctx) };
+    }
+    case "getAvailableModels": {
+      return { models: availableModels(ctx), current: currentModelInfo(ctx) };
+    }
+    case "cycleModel": {
+      const models = availableModels(ctx);
+      if (models.length === 0) throw new Error("no models available");
+      const cur = currentModelInfo(ctx);
+      const idx = Math.max(0, models.findIndex((m) => m.id === cur?.id && m.provider === cur?.provider));
+      const next = models[(idx + 1) % models.length];
+      await applyModel(ctx, next.provider, next.id);
+      return { model: next, thinkingLevel: pi.getThinkingLevel?.() };
+    }
+    case "setModel": {
+      const provider = String(p.provider ?? "");
+      const modelId = String(p.modelId ?? p.id ?? "");
+      await applyModel(ctx, provider, modelId);
+      return { model: currentModelInfo(ctx) };
+    }
+    case "getStatus": {
+      return statusFields();
+    }
+    default:
+      throw new Error(`unknown action: ${action}`);
+  }
+}
+
+async function applyModel(ctx: ExtensionContext | null, provider: string, modelId: string): Promise<void> {
+  const pi = runtime!;
+  const model = ctx?.modelRegistry?.find(provider, modelId);
+  if (!model) throw new Error(`model not found: ${provider}/${modelId}`);
+  const ok = await pi.setModel(model as any);
+  if (!ok) throw new Error(`could not set model (missing auth?): ${provider}/${modelId}`);
+  pushStatus(ctx, {});
+}
+
+// ---------------------------------------------------------------------------
+// Model / thinking helpers
+// ---------------------------------------------------------------------------
+
+function availableModels(ctx: ExtensionContext | null): any[] {
+  try {
+    const list = ctx?.modelRegistry?.getAvailable?.() ?? [];
+    return list.map((m: any) => ({
+      id: m.id,
+      name: m.name ?? m.id,
+      provider: m.provider,
+      reasoning: !!m.reasoning,
+      contextWindow: m.contextWindow,
+      maxTokens: m.maxTokens,
+      label: `${ctx?.modelRegistry?.getProviderDisplayName?.(m.provider) ?? m.provider} / ${m.name ?? m.id}`,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function currentModelInfo(ctx: ExtensionContext | null): any | null {
+  const m: any = ctx?.model;
+  if (!m) return null;
+  return {
+    id: m.id,
+    name: m.name ?? m.id,
+    provider: m.provider,
+    reasoning: !!m.reasoning,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+    label: modelLabel(),
+  };
+}
+
+const ALL_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function thinkingLevelsFor(ctx: ExtensionContext | null): string[] {
+  const m: any = ctx?.model;
+  if (!m) return ["off", "minimal", "low", "medium", "high"];
+  if (!m.reasoning) return ["off"];
+  const map = m.thinkingLevelMap;
+  if (map && typeof map === "object") {
+    const supported = ALL_LEVELS.filter((l) => map[l] !== null && map[l] !== undefined);
+    return supported.length ? supported : ["off", "low", "medium", "high"];
+  }
+  return ["off", "minimal", "low", "medium", "high", "xhigh"];
+}
+
+// ---------------------------------------------------------------------------
+// Small text helpers
+// ---------------------------------------------------------------------------
+
+function sessionId(): string {
+  // Prefer pi's real session id (from the session file) so the live session matches
+  // the one discovered on disk. Falls back to the env var, then the pid.
+  try {
+    const f = runtimeCtx?.sessionManager?.getSessionFile?.();
+    const m = f
+      ? String(f).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)
+      : null;
+    if (m) return m[1];
+  } catch {
+    /* ignore */
+  }
+  return process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
+}
+
+function modelLabel(): string {
+  const m: any = runtimeCtx?.model;
+  if (!m) return "";
+  const provider = (m.provider ?? "") as string;
+  return provider ? `${provider}/${m.id}` : String(m.id ?? "");
+}
+
+function textOf(m: any): string {
+  const c = m?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c
+      .map((x: any) => {
+        if (typeof x === "string") return x;
+        if (x?.type === "text") return x.text ?? "";
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return m?.text ?? "";
+}
+
+function thinkingOf(m: any): string | undefined {
+  const c = m?.content;
+  if (Array.isArray(c)) {
+    const t = c.find((x: any) => x?.type === "thinking" || x?.type === "reasoning");
+    return t?.text ?? t?.thinking;
+  }
+  return m?.thinking;
+}
+
+function extractDelta(event: any): string {
+  const ev = event?.assistantMessageEvent ?? event?.event;
+  if (!ev) return "";
+  if (typeof ev === "string") return ev;
+  if (ev.type === "text_delta" || ev.type === "delta") return ev.text ?? ev.delta ?? "";
+  if (ev.type === "content_delta") return ev.delta ?? "";
+  return "";
+}
+
+function summarizeTool(event: any): string {
+  const r = event?.result;
+  const name = event?.toolName ?? "tool";
+  if (event?.isError) return `${name} failed`;
+  const c = r?.content;
+  if (Array.isArray(c)) {
+    const t = c.find((x: any) => x?.type === "text");
+    return truncate(String(t?.text ?? ""), 4000);
+  }
+  return `${name} done`;
+}
+
+/** A short one-line label for a tool call (command / path / query / url). */
+function toolLabel(name: string, args: any): string {
+  if (!args || typeof args !== "object") return name;
+  if (typeof args.command === "string") return truncate(args.command.replace(/\s+/g, " ").trim(), 200);
+  if (typeof args.path === "string") return args.path;
+  if (typeof args.file_path === "string") return args.file_path;
+  if (typeof args.query === "string") return truncate(args.query, 200);
+  if (typeof args.url === "string") return truncate(args.url, 200);
+  if (typeof args.question === "string") return truncate(args.question, 200);
+  return name;
+}
+
+function pathOf(args: any): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  if (typeof args.path === "string") return args.path;
+  if (typeof args.file_path === "string") return args.file_path;
+  return undefined;
+}
+
+/** Prefer pi's own diff (edit) else synthesize one (write). */
+function diffFor(name: string, args: any, result: any): string | undefined {
+  const d = result?.details?.diff;
+  if (typeof d === "string" && d) return truncate(d, 40_000);
+  if (name === "write" && args && typeof args.content === "string") {
+    return truncate(
+      String(args.content)
+        .split("\n")
+        .map((l: string) => `+${l}`)
+        .join("\n"),
+      40_000
+    );
+  }
+  return undefined;
+}
+
+/** A short human preview of a tool's arguments (e.g. the shell command). */
+function previewArgs(args: any): string {
+  if (!args || typeof args !== "object") return "";
+  if (typeof args.command === "string") return truncate(args.command, 400);
+  if (typeof args.path === "string") return truncate(args.path, 400);
+  if (typeof args.pattern === "string") return truncate(args.pattern, 400);
+  if (typeof args.file_path === "string") return truncate(args.file_path, 400);
+  try {
+    return truncate(JSON.stringify(args), 400);
+  } catch {
+    return "";
+  }
+}
+function preview(ctx: ExtensionContext | null): string {
+  return truncate(streamedBuffer || lastCtxCapture, 120);
+}
+
+function kindLabel(kind?: string): string {
+  switch (kind) {
+    case "confirm":
+      return "A confirmation";
+    case "select":
+      return "A choice";
+    case "input":
+      return "A text prompt";
+    case "editor":
+      return "An editor";
+    default:
+      return "A prompt";
+  }
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// ---------------------------------------------------------------------------
+// /remote command — advertise + pair via QR
+// ---------------------------------------------------------------------------
+
+async function remoteCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? "").toLowerCase();
+
+  if (sub === "hide") {
+    ctx.ui.setWidget("pi-remote-pair", undefined);
+    ctx.ui.notify("Pi Remote pairing card hidden.", "info");
+    return;
+  }
+
+  if (sub === "advertise") {
+    const on = (parts[1] ?? "on").toLowerCase() !== "off";
+    const res = await bridgePost("/advertise", { advertise: on });
+    ctx.ui.notify(res ? `Advertising ${on ? "enabled" : "disabled"}.` : "Bridge not reachable.", on ? "info" : "warning");
+    return;
+  }
+
+  if (sub === "restart") {
+    teardownSocket();
+    await stopBridge();
+    await ensureBridge();
+    setTimeout(connect, 500);
+    ctx.ui.notify("Pi Remote bridge restarting…", "info");
+    return;
+  }
+
+  // Default / status / pair / token: make sure the bridge is up and advertising.
+  const up = await ensureBridge();
+  const info = await fetchPairInfo();
+
+  if (!info) {
+    ctx.ui.notify(
+      "Pi Remote bridge isn't reachable. Start it with: pi-remote-bridge (or `npm run dev` in the bridge folder).",
+      "warning"
+    );
+    return;
+  }
+
+  if (sub === "token") {
+    ctx.ui.notify(`Token: ${info.token}`, "info");
+    return;
+  }
+
+  if (sub === "status") {
+    ctx.ui.notify(
+      `Pi Remote — ${info.hostname} · ${info.ips[0]?.ip ?? "?"} · port ${info.port} · advertising ${info.advertising ? "on" : "off"} · token ${info.token}`,
+      "info"
+    );
+    return;
+  }
+
+  // Show the pairing card + QR as a persistent widget (dismiss with /remote hide).
+  await showPairingWidget(ctx, info);
+  ctx.ui.notify(
+    `Scan this QR with the Pi Remote iPhone app (or tap "Add Computer"). Bridge ${up ? "running" : "started"}.`,
+    "info"
+  );
+}
+
+interface PairInfo {
+  hostname: string;
+  port: number;
+  token: string;
+  advertising: boolean;
+  ips: { label: string; ip: string }[];
+}
+
+async function fetchPairInfo(): Promise<PairInfo | null> {
+  try {
+    const res = await fetch(`${BRIDGE_HTTP}/pair`);
+    if (!res.ok) return null;
+    return (await res.json()) as PairInfo;
+  } catch {
+    return null;
+  }
+}
+
+async function bridgePost(path: string, body: unknown): Promise<boolean> {
+  try {
+    const res = await fetch(`${BRIDGE_HTTP}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureBridge(): Promise<boolean> {
+  if (await bridgeHealthy()) return true;
+  const started = await startBridge();
+  if (!started) return false;
+  for (let i = 0; i < 20; i++) {
+    await sleep(300);
+    if (await bridgeHealthy()) return true;
+  }
+  return false;
+}
+
+async function bridgeHealthy(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BRIDGE_HTTP}/health`, { signal: AbortSignal.timeout(800) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function startBridge(): Promise<boolean> {
+  // Spawn the bridge as a detached background process. Resolution order:
+  //   PI_REMOTE_BRIDGE_BIN >
+  //   sibling bridge/dist/bridge/src/index.js >
+  //   sibling bridge/src/index.ts (tsx dev) >
+  //   `pi-remote-bridge` on PATH >
+  //   `npx --yes pi-remote-bridge`
+  //
+  // On Windows, npm-installed bins are `.cmd` shims that `spawn` can't execute
+  // directly, so those candidates go through a shell (with quoting).
+  const { spawn } = await import("node:child_process");
+  const { existsSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, resolve } = await import("node:path");
+
+  const win = process.platform === "win32";
+  const isScript = (p: string) => /\.(m?js|cjs)$/i.test(p);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates: { cmd: string; args: string[]; shell?: boolean }[] = [];
+
+  if (process.env.PI_REMOTE_BRIDGE_BIN) {
+    const bin = process.env.PI_REMOTE_BRIDGE_BIN;
+    candidates.push(isScript(bin)
+      ? { cmd: process.execPath, args: [bin] }
+      : { cmd: bin, args: [], shell: win });
+  }
+
+  const dist = resolve(here, "..", "..", "bridge", "dist", "bridge", "src", "index.js");
+  if (existsSync(dist)) candidates.push({ cmd: process.execPath, args: [dist] });
+
+  const devEntry = resolve(here, "..", "..", "bridge", "src", "index.ts");
+  if (existsSync(devEntry)) {
+    const tsx = resolve(here, "..", "..", "bridge", "node_modules", ".bin", win ? "tsx.cmd" : "tsx");
+    if (existsSync(tsx)) candidates.push({ cmd: tsx, args: [devEntry], shell: win });
+    else candidates.push({ cmd: "npx", args: ["--yes", "tsx", devEntry], shell: true });
+  }
+
+  candidates.push({ cmd: "pi-remote-bridge", args: [], shell: win });
+  candidates.push({ cmd: "npx", args: ["--yes", "pi-remote-bridge"], shell: true });
+
+  for (const c of candidates) {
+    try {
+      const options: any = { detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env } };
+      let child;
+      if (c.shell) {
+        const quote = (s: string) => (/\s/.test(s) ? `"${s}"` : s);
+        child = spawn([c.cmd, ...c.args].map(quote).join(" "), { ...options, shell: true });
+      } else {
+        child = spawn(c.cmd, c.args, options);
+      }
+      child.unref();
+      await sleep(600);
+      if (await bridgeHealthy()) return true;
+    } catch {
+      /* try next candidate */
+    }
+  }
+  return false;
+}
+
+async function stopBridge(): Promise<void> {
+  try {
+    await fetch(`${BRIDGE_HTTP}/shutdown`, { method: "POST" });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): Promise<void> {
+  const host = info.ips[0]?.ip ?? "127.0.0.1";
+  const payload =
+    `pi-remote://connect?host=${encodeURIComponent(host)}&port=${info.port}` +
+    `&token=${encodeURIComponent(info.token)}&name=${encodeURIComponent(info.hostname)}` +
+    (process.env.PI_REMOTE_TLS ? "&tls=1" : "");
+
+  const lines: string[] = [];
+  lines.push(`  ┌─ Pi Remote · scan to pair ──────────────────────────┐`);
+  lines.push(`  │  Computer: ${info.hostname.padEnd(41)}│`);
+  lines.push(`  │  Address : ${(host + ":" + info.port).padEnd(41)}│`);
+  lines.push(`  │  Token   : ${info.token.padEnd(41)}│`);
+  lines.push(`  │  Network : ${info.ips.map((i) => i.ip).join(", ").slice(0, 41).padEnd(41)}│`);
+  lines.push(`  └────────────────────────────────────────────────────┘`);
+
+  let qr = "";
+  try {
+    const QRCode: any = await import("qrcode");
+    qr = await QRCode.toString(payload, { type: "terminal", small: true, errorCorrectionLevel: "M" });
+  } catch {
+    qr = "(install the 'qrcode' package in ~/.pi/agent/extensions/pi-remote to show a QR)";
+  }
+  for (const l of String(qr).split("\n")) lines.push("  " + l);
+
+  lines.push("");
+  lines.push("  Pairing string (copy if the camera is unavailable):");
+  lines.push("  " + payload);
+
+  ctx.ui.setWidget("pi-remote-pair", lines, { position: "above" } as any);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}

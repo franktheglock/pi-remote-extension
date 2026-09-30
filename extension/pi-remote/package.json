@@ -1,0 +1,15 @@
+{
+  "name": "pi-remote",
+  "version": "0.1.0",
+  "description": "Pi Remote extension — lets the Pi Remote iPhone app discover, view, and control this pi session (chat, model switching) and notifies you when a session completes or needs input.",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5"
+  }
+}
