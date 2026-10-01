@@ -139,6 +139,20 @@ explicit opt-in; `/remote advertise off` stops broadcasting the token.
 `shared/protocol.ts` defines every message exchanged between the extension, the bridge and
 the app.
 
+## Support
+
+If the Pi Remote iPhone app isn't connecting to this bridge, or something
+else isn't working:
+
+1. Check **Pair** above — most issues are a wrong host/port or a stale token
+   (run `/remote` again to see the current QR and token).
+2. Make sure iPhone and computer are on the same network (or the same
+   Tailscale tailnet), and the bridge is up: `curl http://<host>:8877/health`.
+3. Still stuck? [Open an issue](https://github.com/franktheglock/pi-remote-extension/issues)
+   with your bridge log, iOS version, and what the app shows — or reinstall with
+   `update.sh` and `/reload` first, since most reports turn out to be a stale
+   bridge or extension copy.
+
 ## License
 
 MIT
