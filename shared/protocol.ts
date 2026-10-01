@@ -217,7 +217,7 @@ export type BridgeToApp =
   | { type: "history"; sessionId: string; messages: TranscriptMessage[] }
   | { type: "stats"; stats: StatsPayload }
   | { type: "dirs"; id: string; listing: DirListing }
-  | { type: "launched"; id: string; ok: boolean; cwd: string; error?: string }
+  | { type: "launched"; id: string; ok: boolean; cwd: string; mode?: string; error?: string }
   | {
       type: "ask";
       sessionId: string;

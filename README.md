@@ -19,6 +19,42 @@ phone. This repo is the **host side** (the iOS app is a separate, private projec
 └───────────────────────────┘                                   └────────────────┘
 ```
 
+## Quick install with your agent
+
+Paste this into pi (or any coding agent with a shell) on the computer you want to control:
+
+```text
+Set up Pi Remote on this computer so I can control my pi sessions from my iPhone.
+Project: https://github.com/franktheglock/pi-remote-extension
+
+1. Check prerequisites: `node --version` must be 22 or newer, and `pi` must be on
+   my PATH. If either is missing, stop and tell me what to install.
+2. Install the extension as a pi package:
+   pi install git:github.com/franktheglock/pi-remote-extension
+   If it is already installed, run `pi update --extensions` instead.
+3. Do not start the bridge yourself and do not build anything. The extension
+   starts the bridge the first time I run /remote.
+4. Check whether a bridge is already running:
+   curl -s http://127.0.0.1:8877/health
+   Tell me whether it answered. No answer is fine at this point.
+5. Tell me to do these two things myself, since they are pi slash commands you
+   can't run for me:
+   - run /reload in each open pi session (or start a new one)
+   - run /remote, then scan the QR code it shows with the Pi Remote iPhone app
+
+Rules:
+- Don't print, log, or copy my pairing token anywhere (it lives in ~/.pi-remote/token).
+- Don't change firewall, router, or VPN settings, and don't expose port 8877 to
+  the internet. If something is blocked, tell me what and let me decide.
+- On Windows, use PowerShell and `curl.exe` instead of `curl`.
+- If a step fails, show me the exact error and stop instead of trying workarounds.
+
+When you're done, give me a short summary: what you installed, whether the
+bridge answered, and what I need to do next.
+```
+
+Prefer to do it by hand? The same steps are below.
+
 ## Install the extension
 
 **As a pi package (recommended — `pi update --extensions` works):**
@@ -71,8 +107,12 @@ the app.
 ```bash
 ./update.sh          # git pull + npm install + install the extension folder
 ```
-or, if installed as a pi package, `pi update --extensions`. The **bridge** is a separate
-process — restart it after `git pull && npm install`.
+or, if installed as a pi package, `pi update --extensions`.
+
+The **bridge** is a separate, long-running process, so it keeps running the old code until
+it restarts. After updating, run `/reload` and then **`/remote`** in pi: the extension notices
+the bridge is older than the code on disk and restarts it. `/remote restart` forces a restart.
+If you started the bridge yourself (`npm run dev`), restart it yourself.
 
 > `pi update --extensions` only updates extensions pi installed as *packages*. A folder you
 > copied in by hand isn't tracked — use `update.sh` or re-copy the folder, then `/reload`.

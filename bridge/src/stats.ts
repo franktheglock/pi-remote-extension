@@ -1,27 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { listSessionFiles } from "./store.js";
 
-export interface ModelUsage {
-  provider: string;
-  model: string;
-  tokens: number;
-  cost: number;
-  messages: number;
-}
-
-export interface PeriodStats {
-  tokens: number;
-  cost: number;
-  messages: number;
-  topModel?: ModelUsage;
-}
-
-export interface StatsPayload {
-  totals: { tokens: number; cost: number; messages: number; sessions: number };
-  periods: { today: PeriodStats; week: PeriodStats; month: PeriodStats; year: PeriodStats };
-  topModels: ModelUsage[];
-  generatedAt: number;
-}
+// The wire types live in shared/protocol.ts (the app decodes the same shapes).
+import type { ModelUsage, PeriodStats, StatsPayload } from "../../shared/protocol.js";
+export type { ModelUsage, PeriodStats, StatsPayload };
 
 interface Acc {
   tokens: number;
