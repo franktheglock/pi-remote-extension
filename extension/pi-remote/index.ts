@@ -1196,13 +1196,14 @@ async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): 
   lines.push(`  │  Network : ${info.ips.map((i) => i.ip).join(", ").slice(0, 41).padEnd(41)}│`);
   lines.push(`  └────────────────────────────────────────────────────┘`);
 
-  // Error correction "L" keeps the code small enough for an 80-column
-  // terminal; a QR read off a screen doesn't need the redundancy.
+  // Two renderings: a solid one (preferred) and a compact one for narrow windows.
   let qrLines: string[] = [];
+  let qrCompact: string[] = [];
   try {
     const QRCode: any = await import("qrcode");
-    const qr = await QRCode.toString(payload, { type: "terminal", small: true, errorCorrectionLevel: "L" });
-    qrLines = String(qr).split("\n").map((l) => "  " + l);
+    const modules = (QRCode.default ?? QRCode).create(payload, { errorCorrectionLevel: "L" }).modules;
+    qrLines = renderQRSolid(modules).map((l) => "  " + l);
+    qrCompact = renderQR(modules).map((l) => "  " + l);
   } catch {
     qrLines = ["  (install the 'qrcode' package in ~/.pi/agent/extensions/pi-remote to show a QR)"];
   }
@@ -1224,6 +1225,7 @@ async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): 
       const out: string[] = [];
       for (const l of lines) out.push(...wrap(l, width));
       if (qrLines.every((l) => visible(l) <= width)) out.push(...qrLines);
+      else if (qrCompact.length && qrCompact.every((l) => visible(l) <= width)) out.push(...qrCompact);
       else out.push(...wrap("  (Widen this window to show the QR code, or use the pairing string below.)", width));
       out.push("");
       out.push(...wrap("  Pairing string (copy if the camera is unavailable):", width));
@@ -1234,6 +1236,64 @@ async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): 
   };
 
   ctx.ui.setWidget("pi-remote-pair", (() => component) as any, { placement: "aboveEditor" } as any);
+}
+
+/**
+ * Draw a QR code from background colors alone: each module is two spaces wide
+ * and one row tall. No glyphs are involved, so it stays solid in terminals
+ * whose fonts or line spacing leave gaps around block characters (which makes
+ * a half-block QR unreadable to a camera). Bigger than the compact form.
+ */
+function renderQRSolid(modules: { size: number; data: ArrayLike<number | boolean> }): string[] {
+  const quiet = 2;
+  const size = modules.size;
+  const white = "\x1b[48;2;255;255;255m";
+  const black = "\x1b[48;2;0;0;0m";
+  const lines: string[] = [];
+  for (let y = -quiet; y < size + quiet; y++) {
+    let row = "";
+    let current = "";
+    for (let x = -quiet; x < size + quiet; x++) {
+      const dark = x >= 0 && y >= 0 && x < size && y < size && !!modules.data[y * size + x];
+      const color = dark ? black : white;
+      if (color !== current) {
+        row += color;
+        current = color;
+      }
+      row += "  ";
+    }
+    lines.push(row + "\x1b[0m");
+  }
+  return lines;
+}
+
+/**
+ * Compact form: half-block characters, two modules per text row, with the
+ * 4-module quiet zone the QR spec asks for and explicit pure white / black.
+ * Half the size of the solid form, but relies on the font drawing block
+ * characters edge to edge.
+ */
+function renderQR(modules: { size: number; data: ArrayLike<number | boolean> }): string[] {
+  const quiet = 4;
+  const size = modules.size;
+  const total = size + quiet * 2;
+  const dark = (x: number, y: number): boolean => {
+    const mx = x - quiet;
+    const my = y - quiet;
+    return mx >= 0 && my >= 0 && mx < size && my < size && !!modules.data[my * size + mx];
+  };
+  const colors = "\x1b[48;2;255;255;255m\x1b[38;2;0;0;0m";
+  const lines: string[] = [];
+  for (let y = 0; y < total; y += 2) {
+    let row = "";
+    for (let x = 0; x < total; x++) {
+      const top = dark(x, y);
+      const bottom = dark(x, y + 1);
+      row += top && bottom ? "\u2588" : top ? "\u2580" : bottom ? "\u2584" : " ";
+    }
+    lines.push(colors + row + "\x1b[0m");
+  }
+  return lines;
 }
 
 function sleep(ms: number): Promise<void> {
