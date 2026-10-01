@@ -1183,9 +1183,13 @@ async function stopBridge(): Promise<void> {
 
 async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): Promise<void> {
   const host = info.ips[0]?.ip ?? "127.0.0.1";
+  const alt = [...new Set(info.ips.map((i) => i.ip))].filter((ip) => ip !== host).slice(0, 4);
   const payload =
     `pi-remote://connect?host=${encodeURIComponent(host)}&port=${info.port}` +
     `&token=${encodeURIComponent(info.token)}&name=${encodeURIComponent(info.hostname)}` +
+    // The computer's other addresses (e.g. Tailscale), so the app can fall
+    // back to them when the first one isn't reachable. Older apps ignore this.
+    (alt.length ? `&alt=${alt.map(encodeURIComponent).join(",")}` : "") +
     (process.env.PI_REMOTE_TLS ? "&tls=1" : "");
 
   const lines: string[] = [];
