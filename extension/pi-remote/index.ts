@@ -324,7 +324,11 @@ function connect(): void {
   ws.addEventListener("open", () => {
     conn.connected = true;
     debug(`connected ${BRIDGE_WS}`);
+    // Clear the handle too: a cancelled-but-still-set timer makes
+    // scheduleReconnect() think a retry is pending, so the next disconnect
+    // (e.g. a bridge restart) would never be retried.
     if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+    conn.reconnectTimer = null;
     sendRaw({
       type: "register",
       sessionId: sessionId(),
@@ -980,13 +984,26 @@ async function bridgeHealthy(): Promise<boolean> {
   }
 }
 
-/** The bridge folder shipped next to this extension, if any. */
-async function siblingBridgeRoot(): Promise<string | null> {
-  const { existsSync } = await import("node:fs");
+/**
+ * Where the bridge's code lives: the folder shipped next to this extension, or
+ * (when the extension was copied on its own) the location the bridge recorded
+ * in ~/.pi-remote/bridge-root the last time it ran.
+ */
+async function bridgeRoot(): Promise<string | null> {
+  const { existsSync, readFileSync } = await import("node:fs");
   const { fileURLToPath } = await import("node:url");
-  const { dirname, resolve } = await import("node:path");
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "bridge");
-  return existsSync(resolve(root, "src")) ? root : null;
+  const { dirname, resolve, join } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const sibling = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "bridge");
+  if (existsSync(resolve(sibling, "src"))) return sibling;
+  try {
+    const home = process.env.PI_REMOTE_HOME ?? join(homedir(), ".pi-remote");
+    const recorded = readFileSync(join(home, "bridge-root"), "utf8").trim();
+    if (recorded && existsSync(resolve(recorded, "src"))) return recorded;
+  } catch {
+    /* never recorded */
+  }
+  return null;
 }
 
 /** Newest file mtime (ms) under `dir` — mirrors bridge/src/buildinfo.ts. */
@@ -1018,15 +1035,15 @@ async function newestMtime(dir: string): Promise<number> {
 }
 
 /**
- * True when the running bridge was started from our sibling bridge folder and
- * that folder's source has changed since. Bridges started from elsewhere
+ * True when the running bridge was started from our bridge folder and that
+ * folder's source has changed since. Bridges started from elsewhere
  * (PI_REMOTE_BRIDGE_BIN, npx) or too old to report a stamp are left alone.
  */
 async function bridgeOutdated(): Promise<boolean> {
   try {
     const res = await fetch(`${BRIDGE_HTTP}/health`, { signal: AbortSignal.timeout(800) });
     const health = (await res.json()) as { root?: string; codeStamp?: number };
-    const root = await siblingBridgeRoot();
+    const root = await bridgeRoot();
     if (!root || !health.root || typeof health.codeStamp !== "number") return false;
     const same = process.platform === "win32"
       ? health.root.toLowerCase() === root.toLowerCase()
@@ -1042,8 +1059,8 @@ async function bridgeOutdated(): Promise<boolean> {
 async function startBridge(): Promise<boolean> {
   // Spawn the bridge as a detached background process. Resolution order:
   //   PI_REMOTE_BRIDGE_BIN >
-  //   sibling bridge/dist/bridge/src/index.js >
-  //   sibling bridge/src/index.ts (tsx dev) >
+  //   <bridge root>/dist/bridge/src/index.js >
+  //   <bridge root>/src/index.ts (tsx dev) >
   //   `pi-remote-bridge` on PATH >
   //   `npx --yes pi-remote-bridge`
   //
@@ -1051,12 +1068,10 @@ async function startBridge(): Promise<boolean> {
   // directly, so those candidates go through a shell (with quoting).
   const { spawn } = await import("node:child_process");
   const { existsSync } = await import("node:fs");
-  const { fileURLToPath } = await import("node:url");
-  const { dirname, resolve } = await import("node:path");
+  const { resolve } = await import("node:path");
 
   const win = process.platform === "win32";
   const isScript = (p: string) => /\.(m?js|cjs)$/i.test(p);
-  const here = dirname(fileURLToPath(import.meta.url));
   const candidates: { cmd: string; args: string[]; shell?: boolean }[] = [];
 
   if (process.env.PI_REMOTE_BRIDGE_BIN) {
@@ -1068,18 +1083,20 @@ async function startBridge(): Promise<boolean> {
 
   // Prefer a compiled build — but not one older than the source (dist/ is a
   // local, gitignored build that `pi update` never refreshes).
-  const bridgeDir = resolve(here, "..", "..", "bridge");
-  const dist = resolve(bridgeDir, "dist", "bridge", "src", "index.js");
-  if (existsSync(dist) &&
-      (await newestMtime(resolve(bridgeDir, "dist"))) >= (await newestMtime(resolve(bridgeDir, "src")))) {
-    candidates.push({ cmd: process.execPath, args: [dist] });
-  }
+  const bridgeDir = await bridgeRoot();
+  if (bridgeDir) {
+    const dist = resolve(bridgeDir, "dist", "bridge", "src", "index.js");
+    if (existsSync(dist) &&
+        (await newestMtime(resolve(bridgeDir, "dist"))) >= (await newestMtime(resolve(bridgeDir, "src")))) {
+      candidates.push({ cmd: process.execPath, args: [dist] });
+    }
 
-  const devEntry = resolve(here, "..", "..", "bridge", "src", "index.ts");
-  if (existsSync(devEntry)) {
-    const tsx = resolve(here, "..", "..", "bridge", "node_modules", ".bin", win ? "tsx.cmd" : "tsx");
-    if (existsSync(tsx)) candidates.push({ cmd: tsx, args: [devEntry], shell: win });
-    else candidates.push({ cmd: "npx", args: ["--yes", "tsx", devEntry], shell: true });
+    const devEntry = resolve(bridgeDir, "src", "index.ts");
+    if (existsSync(devEntry)) {
+      const tsx = resolve(bridgeDir, "node_modules", ".bin", win ? "tsx.cmd" : "tsx");
+      if (existsSync(tsx)) candidates.push({ cmd: tsx, args: [devEntry], shell: win });
+      else candidates.push({ cmd: "npx", args: ["--yes", "tsx", devEntry], shell: true });
+    }
   }
 
   candidates.push({ cmd: "pi-remote-bridge", args: [], shell: win });
@@ -1095,9 +1112,19 @@ async function startBridge(): Promise<boolean> {
       } else {
         child = spawn(c.cmd, c.args, options);
       }
+      // A missing binary is reported as an async 'error' event, not a throw.
+      // Without a listener it becomes an uncaughtException and takes pi down.
+      let dead = false;
+      child.on("error", () => { dead = true; });
+      child.on("exit", () => { dead = true; });
       child.unref();
-      await sleep(600);
-      if (await bridgeHealthy()) return true;
+      // Give it a few seconds to come up (tsx / npx are slow to start), but
+      // move on as soon as the process is known to have failed.
+      for (let i = 0; i < 16; i++) {
+        await sleep(300);
+        if (await bridgeHealthy()) return true;
+        if (dead) break;
+      }
     } catch {
       /* try next candidate */
     }

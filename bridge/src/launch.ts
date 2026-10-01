@@ -1,5 +1,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { readdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { listSessionFiles } from "./store.js";
 import { join, dirname, resolve } from "node:path";
 import os from "node:os";
 
@@ -59,9 +61,20 @@ function piCommand(): string {
  * headless box (or over SSH) we prefer **tmux**, which works without a display.
  * Each candidate is actually probed, and we report a real error if none work.
  */
-export async function launchPi(cwd: string): Promise<LaunchResult> {
-  const dir = resolve(cwd && cwd.trim() ? cwd : os.homedir());
-  const cmd = piCommand();
+export async function launchPi(cwd: string, resumeSessionId?: string): Promise<LaunchResult> {
+  let dir = resolve(cwd && cwd.trim() ? cwd : os.homedir());
+  let cmd = piCommand();
+
+  if (resumeSessionId) {
+    // Reopen a stored session. Point pi at the session file itself so the
+    // lookup doesn't depend on which folder we start in.
+    if (!/^[0-9a-f-]{8,64}$/i.test(resumeSessionId)) return { ok: false, error: "Invalid session id." };
+    const file = (await listSessionFiles()).find((s) => s.sessionId === resumeSessionId)?.file;
+    if (!file) return { ok: false, error: "That session's file is no longer on this computer." };
+    cmd += ` --session ${process.platform === "win32" ? `"${file}"` : shq(file)}`;
+    // The folder the session ran in may have been moved or deleted since.
+    if (!existsSync(dir)) dir = os.homedir();
+  }
   const run = `cd ${shq(dir)} && exec ${cmd}`;
 
   if (process.platform === "darwin") {
@@ -114,7 +127,8 @@ export async function launchPi(cwd: string): Promise<LaunchResult> {
   }
 
   // 3) Detached, best effort (a TUI without a tty may not render).
-  return trySpawn(cmd, [], { cwd: dir }, "detached");
+  // Through a shell, since `cmd` may carry arguments (e.g. --session).
+  return trySpawn("sh", ["-c", `exec ${cmd}`], { cwd: dir }, "detached");
 }
 
 function trySpawn(bin: string, args: string[], opts: any, mode: string): Promise<LaunchResult> {

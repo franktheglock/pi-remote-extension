@@ -39,8 +39,23 @@ export function loadOrCreateToken(explicit?: string): string {
   }
 }
 
+/**
+ * Remember where this bridge lives, so an extension that was copied on its own
+ * (no sibling bridge folder) can still start and restart it.
+ */
+function recordBridgeRoot(): void {
+  try {
+    const p = join(tokenPath(), "..", "bridge-root");
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, BRIDGE_ROOT);
+  } catch {
+    /* best effort */
+  }
+}
+
 export async function startServer(opts: ServerOptions): Promise<{ close: () => Promise<void>; registry: Registry; advertiser: Advertiser }> {
   const token = loadOrCreateToken(opts.token);
+  recordBridgeRoot();
   const registry = new Registry();
   const advertiser = new Advertiser();
   const hostname = os.hostname();
@@ -127,8 +142,12 @@ export async function startServer(opts: ServerOptions): Promise<{ close: () => P
           send(ws, { type: "dirs", id: msg.id, listing: await listDirs(msg.path) });
           break;
         case "launch": {
-          const res = await launchPi(msg.cwd);
-          send(ws, { type: "launched", id: msg.id, ok: res.ok, cwd: msg.cwd, error: res.error, mode: res.mode });
+          // Never start a second pi on a session that's already attached.
+          const attached = msg.sessionId
+            ? registry.liveSessions().some((x) => x.sessionId === msg.sessionId && x.badge !== "offline")
+            : false;
+          const res = attached ? { ok: true, mode: "already-running" } as const : await launchPi(msg.cwd, msg.sessionId);
+          send(ws, { type: "launched", id: msg.id, ok: res.ok, cwd: msg.cwd, error: (res as { error?: string }).error, mode: res.mode });
           break;
         }
         case "history": {

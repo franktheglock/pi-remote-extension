@@ -181,7 +181,8 @@ export type AppToBridge =
       custom?: string;
     }
   | { type: "listDirs"; id: string; path?: string }    // browse the filesystem
-  | { type: "launch"; id: string; cwd: string }        // start a new pi session
+  // Start pi in `cwd`. With `sessionId`, reopen that stored session instead of a new one.
+  | { type: "launch"; id: string; cwd: string; sessionId?: string }
   | { type: "subscribe" }                             // request live updates
   | { type: "history"; sessionId: string; limit?: number }
   | {
