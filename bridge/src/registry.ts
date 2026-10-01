@@ -117,7 +117,17 @@ export class Registry extends EventEmitter {
       case "message": {
         const client = this.extBySocket.get(socket);
         if (!client) return;
-        client.history.push(msg.message);
+        // A tool call reports several times (args streaming → running → done);
+        // keep one history entry per call instead of one per update.
+        const callId = (msg.message as any).toolCallId as string | undefined;
+        let prior = -1;
+        if (callId) {
+          for (let i = client.history.length - 1; i >= 0; i--) {
+            if ((client.history[i] as any).toolCallId === callId) { prior = i; break; }
+          }
+        }
+        if (prior >= 0) client.history[prior] = msg.message;
+        else client.history.push(msg.message);
         if (client.history.length > HISTORY_LIMIT) client.history.splice(0, client.history.length - HISTORY_LIMIT);
         if (msg.message.text) client.summary.lastOutput = truncate(msg.message.text, 160);
         client.summary.updatedAt = Date.now();

@@ -12,6 +12,7 @@ import { listDirs, launchPi } from "./launch.js";
 import { lanAddresses, isLoopback } from "./net.js";
 import { PROTOCOL_VERSION } from "../../shared/protocol.js";
 import type { AppToBridge, BridgeToApp } from "../../shared/protocol.js";
+import { BRIDGE_ROOT, CODE_STAMP } from "./buildinfo.js";
 
 export interface ServerOptions {
   host: string;
@@ -212,6 +213,9 @@ async function handleHttp(
     return json(res, 200, {
       ok: true,
       version: "0.1.0",
+      // Lets the extension restart a bridge that predates an update.
+      root: BRIDGE_ROOT,
+      codeStamp: CODE_STAMP,
       protocol: PROTOCOL_VERSION,
       hostname: os.hostname(),
       port,

@@ -91,6 +91,8 @@ let streamedBuffer = "";
 let currentAssistantText = "";
 let currentAssistantThinking = "";
 const toolArgsById = new Map<string, any>();
+/** Tool calls the model is still writing (not yet executing): id → what we last sent. */
+const draftTools = new Map<string, { name: string; label: string; size: number; at: number }>();
 let appCount = 0;
 const pendingAsks = new Map<string, (answer: any) => void>();
 let lastCtxCapture = "";
@@ -143,6 +145,7 @@ export default function (pi: ExtensionAPI) {
     runtimeCtx = ctx;
     const m: any = event.message;
     if (m?.role !== "assistant") return;
+    streamToolCalls(m);
     // Send the FULL current assistant text + thinking; the app replaces (upserts)
     // the streaming message. Robust to any delta-event shape, and lets thinking
     // stream live even before any text is produced.
@@ -179,6 +182,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_execution_start", async (event, ctx) => {
     runtimeCtx = ctx;
     debug(`tool_start ${event.toolName}`);
+    draftTools.delete(event.toolCallId);
     toolArgsById.set(event.toolCallId, event.args);
     sendMessage({
       role: "toolResult",
@@ -217,6 +221,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_e, ctx) => {
     runtimeCtx = ctx;
     debug("agent_settled");
+    cancelDraftTools();
     setState("idle", ctx);
     notify("complete", "Session complete", preview(ctx) || "The agent finished and is idle.");
   });
@@ -699,6 +704,59 @@ function thinkingOf(m: any): string | undefined {
   return m?.thinking;
 }
 
+/**
+ * Show a tool call as soon as the model starts writing it, instead of waiting
+ * for the arguments to finish. Uses the same toolCallId as tool_execution_*,
+ * so the app keeps updating one row: writing → running → done.
+ */
+function streamToolCalls(m: any): void {
+  if (!Array.isArray(m?.content)) return;
+  const now = Date.now();
+  for (const block of m.content) {
+    if (block?.type !== "toolCall" || typeof block.id !== "string" || !block.id || !block.name) continue;
+    if (toolArgsById.has(block.id)) continue; // already executing
+    const args = block.arguments && typeof block.arguments === "object" ? block.arguments : undefined;
+    const hasArgs = !!args && Object.keys(args).length > 0;
+    const label = toolLabel(block.name, args);
+    const display = hasArgs ? argsDisplay(block.name, args) : undefined;
+    const size = display?.length ?? 0;
+
+    // Send at once when the call appears or its label changes; while the
+    // arguments merely grow (e.g. a long file write), at most every 400ms.
+    const prev = draftTools.get(block.id);
+    if (prev && prev.label === label && (prev.size === size || now - prev.at < 400)) continue;
+    draftTools.set(block.id, { name: block.name, label, size, at: now });
+    sendMessage({
+      role: "toolResult",
+      toolName: block.name,
+      toolCallId: block.id,
+      toolLabel: label,
+      toolArgs: display,
+      filePath: pathOf(args),
+      toolState: "running",
+      text: "",
+      timestamp: now,
+    });
+  }
+}
+
+/** The turn ended with calls that never ran (aborted mid-write) — stop their spinners. */
+function cancelDraftTools(): void {
+  for (const [id, draft] of draftTools) {
+    sendMessage({
+      role: "toolResult",
+      toolName: draft.name,
+      toolCallId: id,
+      toolLabel: draft.label,
+      toolState: "done",
+      isError: true,
+      text: "Cancelled before it ran",
+      timestamp: Date.now(),
+    });
+  }
+  draftTools.clear();
+}
+
 function extractDelta(event: any): string {
   const ev = event?.assistantMessageEvent ?? event?.event;
   if (!ev) return "";
@@ -897,7 +955,13 @@ async function bridgePost(path: string, body: unknown): Promise<boolean> {
 }
 
 async function ensureBridge(): Promise<boolean> {
-  if (await bridgeHealthy()) return true;
+  if (await bridgeHealthy()) {
+    if (!(await bridgeOutdated())) return true;
+    // Our sibling bridge's code changed since that process started (e.g. after
+    // `pi update`) — a running bridge never reloads, so restart it.
+    await stopBridge();
+    for (let i = 0; i < 20 && (await bridgeHealthy()); i++) await sleep(150);
+  }
   const started = await startBridge();
   if (!started) return false;
   for (let i = 0; i < 20; i++) {
@@ -911,6 +975,65 @@ async function bridgeHealthy(): Promise<boolean> {
   try {
     const res = await fetch(`${BRIDGE_HTTP}/health`, { signal: AbortSignal.timeout(800) });
     return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** The bridge folder shipped next to this extension, if any. */
+async function siblingBridgeRoot(): Promise<string | null> {
+  const { existsSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, resolve } = await import("node:path");
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "bridge");
+  return existsSync(resolve(root, "src")) ? root : null;
+}
+
+/** Newest file mtime (ms) under `dir` — mirrors bridge/src/buildinfo.ts. */
+async function newestMtime(dir: string): Promise<number> {
+  const { readdirSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  let newest = 0;
+  const walk = (d: string) => {
+    let entries;
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else {
+        try {
+          newest = Math.max(newest, statSync(p).mtimeMs);
+        } catch {
+          /* vanished */
+        }
+      }
+    }
+  };
+  walk(dir);
+  return Math.floor(newest);
+}
+
+/**
+ * True when the running bridge was started from our sibling bridge folder and
+ * that folder's source has changed since. Bridges started from elsewhere
+ * (PI_REMOTE_BRIDGE_BIN, npx) or too old to report a stamp are left alone.
+ */
+async function bridgeOutdated(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BRIDGE_HTTP}/health`, { signal: AbortSignal.timeout(800) });
+    const health = (await res.json()) as { root?: string; codeStamp?: number };
+    const root = await siblingBridgeRoot();
+    if (!root || !health.root || typeof health.codeStamp !== "number") return false;
+    const same = process.platform === "win32"
+      ? health.root.toLowerCase() === root.toLowerCase()
+      : health.root === root;
+    if (!same) return false;
+    const { join } = await import("node:path");
+    return (await newestMtime(join(root, "src"))) > health.codeStamp;
   } catch {
     return false;
   }
@@ -943,8 +1066,14 @@ async function startBridge(): Promise<boolean> {
       : { cmd: bin, args: [], shell: win });
   }
 
-  const dist = resolve(here, "..", "..", "bridge", "dist", "bridge", "src", "index.js");
-  if (existsSync(dist)) candidates.push({ cmd: process.execPath, args: [dist] });
+  // Prefer a compiled build — but not one older than the source (dist/ is a
+  // local, gitignored build that `pi update` never refreshes).
+  const bridgeDir = resolve(here, "..", "..", "bridge");
+  const dist = resolve(bridgeDir, "dist", "bridge", "src", "index.js");
+  if (existsSync(dist) &&
+      (await newestMtime(resolve(bridgeDir, "dist"))) >= (await newestMtime(resolve(bridgeDir, "src")))) {
+    candidates.push({ cmd: process.execPath, args: [dist] });
+  }
 
   const devEntry = resolve(here, "..", "..", "bridge", "src", "index.ts");
   if (existsSync(devEntry)) {
