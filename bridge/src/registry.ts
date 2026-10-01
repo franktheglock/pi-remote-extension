@@ -27,6 +27,8 @@ export interface ExtClient {
   history: TranscriptMessage[]; // ring buffer of recent messages
   pending: Map<string, PendingCommand>;
   extSessionKey: string;
+  /** A question from the `ask` tool that no app has answered yet. */
+  pendingAsk?: Record<string, unknown>;
 }
 
 const OPEN = 1;
@@ -91,6 +93,10 @@ export class Registry extends EventEmitter {
         this.extBySession.set(key, client);
         this.extBySocket.set(socket, client);
         this.send(socket, { type: "hello", serverVersion: "0.1.0", registered: true });
+        // Tell a newly connected session how many apps are listening. Without
+        // this it assumes none until an app next connects or leaves, and its
+        // `ask` tool falls back to the terminal while the phone shows it running.
+        this.send(socket, { type: "peers", apps: this.apps.size });
         this.markStoredLive(key);
         this.broadcastSessions();
         break;
@@ -128,6 +134,10 @@ export class Registry extends EventEmitter {
         }
         if (prior >= 0) client.history[prior] = msg.message;
         else client.history.push(msg.message);
+        // The ask tool finished (answered, timed out, or answered in the terminal).
+        if ((msg.message as any).toolName === "ask" && (msg.message as any).toolState === "done") {
+            client.pendingAsk = undefined;
+        }
         if (client.history.length > HISTORY_LIMIT) client.history.splice(0, client.history.length - HISTORY_LIMIT);
         if (msg.message.text) client.summary.lastOutput = truncate(msg.message.text, 160);
         client.summary.updatedAt = Date.now();
@@ -167,14 +177,15 @@ export class Registry extends EventEmitter {
       case "ask": {
         const client = this.extBySocket.get(socket);
         if (!client) return;
-        this.broadcast({
+        client.pendingAsk = {
           type: "ask",
           sessionId: client.extSessionKey,
           id: msg.id,
           question: msg.question,
           options: msg.options,
           allowCustom: msg.allowCustom,
-        });
+        };
+        this.broadcast(client.pendingAsk);
         break;
       }
       case "command_result": {
@@ -270,7 +281,13 @@ export class Registry extends EventEmitter {
   sendAnswer(sessionId: string, id: string, index?: number, label?: string, custom?: string): void {
     const client = this.extBySession.get(sessionId);
     if (!client) return;
+    client.pendingAsk = undefined;
     this.send(client.socket, { type: "answer", askId: id, index, label, custom });
+  }
+
+  /** Questions still waiting for an answer, for an app that just connected. */
+  pendingAsks(): Record<string, unknown>[] {
+    return [...this.extBySocket.values()].flatMap((c) => (c.pendingAsk ? [c.pendingAsk] : []));
   }
 
   appCount(): number {

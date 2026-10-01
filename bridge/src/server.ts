@@ -115,6 +115,8 @@ export async function startServer(opts: ServerOptions): Promise<{ close: () => P
             sessions: registry.liveSessions(),
             stored: registry.storedSessions(),
           });
+          // Questions asked while this app was closed or disconnected.
+          for (const ask of registry.pendingAsks()) send(ws, ask as any);
         } else {
           send(ws, { type: "error", message: "unauthorized", code: "auth" });
           ws.close(4401, "unauthorized");
