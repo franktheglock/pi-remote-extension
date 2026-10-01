@@ -3,7 +3,7 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { Type } from "typebox";
 
 /**
@@ -125,6 +125,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     conn.intentionalClose = true;
     teardownSocket();
+    clearSessionOpen();
   });
 
   pi.on("session_info_changed", async (event, ctx) => {
@@ -301,13 +302,46 @@ export default function (pi: ExtensionAPI) {
 
   // Cleanup on process exit.
   process.on("exit", teardownSocket);
+  process.on("exit", clearSessionOpen);
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket connection to the bridge
 // ---------------------------------------------------------------------------
 
+/**
+ * Leave a marker saying "this pi process has this session open". The bridge
+ * checks it before reopening a session from the phone, so it never starts a
+ * second pi on a session that's open here but has lost its bridge connection.
+ */
+let openMarker: string | null = null;
+
+function markSessionOpen(): void {
+  try {
+    const dir = `${process.env.PI_REMOTE_HOME ?? `${process.env.HOME ?? process.env.USERPROFILE ?? "."}/.pi-remote`}/open`;
+    const path = `${dir}/${sessionId()}.pid`;
+    if (path === openMarker) return;
+    clearSessionOpen();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, String(process.pid));
+    openMarker = path;
+  } catch {
+    /* best effort */
+  }
+}
+
+function clearSessionOpen(): void {
+  if (!openMarker) return;
+  try {
+    rmSync(openMarker, { force: true });
+  } catch {
+    /* ignore */
+  }
+  openMarker = null;
+}
+
 function connect(): void {
+  markSessionOpen();
   if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
@@ -886,11 +920,15 @@ async function remoteCommand(args: string, ctx: ExtensionCommandContext): Promis
   }
 
   if (sub === "restart") {
+    ctx.ui.notify("Restarting the Pi Remote bridge…", "info");
     teardownSocket();
     await stopBridge();
-    await ensureBridge();
+    const up = await ensureBridge();
     setTimeout(connect, 500);
-    ctx.ui.notify("Pi Remote bridge restarting…", "info");
+    ctx.ui.notify(
+      up ? "Pi Remote bridge restarted." : "The bridge stopped but didn't start again. Run /remote to try once more.",
+      up ? "info" : "warning"
+    );
     return;
   }
 
@@ -964,7 +1002,6 @@ async function ensureBridge(): Promise<boolean> {
     // Our sibling bridge's code changed since that process started (e.g. after
     // `pi update`) — a running bridge never reloads, so restart it.
     await stopBridge();
-    for (let i = 0; i < 20 && (await bridgeHealthy()); i++) await sleep(150);
   }
   const started = await startBridge();
   if (!started) return false;
@@ -1134,10 +1171,14 @@ async function startBridge(): Promise<boolean> {
 
 async function stopBridge(): Promise<void> {
   try {
-    await fetch(`${BRIDGE_HTTP}/shutdown`, { method: "POST" });
+    await fetch(`${BRIDGE_HTTP}/shutdown`, { method: "POST", signal: AbortSignal.timeout(3000) });
   } catch {
-    /* ignore */
+    /* not running, or didn't answer */
   }
+  // The bridge replies before it exits, so it still looks healthy for a moment.
+  // Wait until it's really gone — otherwise a restart sees a "running" bridge,
+  // starts nothing, and is left with no bridge at all.
+  for (let i = 0; i < 25 && (await bridgeHealthy()); i++) await sleep(200);
 }
 
 async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): Promise<void> {

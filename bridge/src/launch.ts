@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from "node:child_process";
 import { readdir, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { listSessionFiles } from "./store.js";
 import { join, dirname, resolve } from "node:path";
 import os from "node:os";
@@ -69,6 +69,15 @@ export async function launchPi(cwd: string, resumeSessionId?: string): Promise<L
     // Reopen a stored session. Point pi at the session file itself so the
     // lookup doesn't depend on which folder we start in.
     if (!/^[0-9a-f-]{8,64}$/i.test(resumeSessionId)) return { ok: false, error: "Invalid session id." };
+    // Open in a pi that has lost its connection to us? Starting another pi on
+    // the same session file would have two writers. (Live ones are caught earlier.)
+    const holder = openHolder(resumeSessionId);
+    if (holder) {
+      return {
+        ok: false,
+        error: `That session is already open on this computer (pi, process ${holder}) but isn't connected. Run /reload in that pi window.`,
+      };
+    }
     const file = (await listSessionFiles()).find((s) => s.sessionId === resumeSessionId)?.file;
     if (!file) return { ok: false, error: "That session's file is no longer on this computer." };
     cmd += ` --session ${process.platform === "win32" ? `"${file}"` : shq(file)}`;
@@ -129,6 +138,19 @@ export async function launchPi(cwd: string, resumeSessionId?: string): Promise<L
   // 3) Detached, best effort (a TUI without a tty may not render).
   // Through a shell, since `cmd` may carry arguments (e.g. --session).
   return trySpawn("sh", ["-c", `exec ${cmd}`], { cwd: dir }, "detached");
+}
+
+/** The pid of a running pi that has marked this session open, if any. */
+function openHolder(sessionId: string): number | null {
+  try {
+    const home = process.env.PI_REMOTE_HOME ?? join(os.homedir(), ".pi-remote");
+    const pid = Number(readFileSync(join(home, "open", `${sessionId}.pid`), "utf8").trim());
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    process.kill(pid, 0); // throws if that process is gone (stale marker)
+    return pid;
+  } catch {
+    return null;
+  }
 }
 
 function trySpawn(bin: string, args: string[], opts: any, mode: string): Promise<LaunchResult> {
