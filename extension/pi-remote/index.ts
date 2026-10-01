@@ -1196,20 +1196,44 @@ async function showPairingWidget(ctx: ExtensionCommandContext, info: PairInfo): 
   lines.push(`  │  Network : ${info.ips.map((i) => i.ip).join(", ").slice(0, 41).padEnd(41)}│`);
   lines.push(`  └────────────────────────────────────────────────────┘`);
 
-  let qr = "";
+  // Error correction "L" keeps the code small enough for an 80-column
+  // terminal; a QR read off a screen doesn't need the redundancy.
+  let qrLines: string[] = [];
   try {
     const QRCode: any = await import("qrcode");
-    qr = await QRCode.toString(payload, { type: "terminal", small: true, errorCorrectionLevel: "M" });
+    const qr = await QRCode.toString(payload, { type: "terminal", small: true, errorCorrectionLevel: "L" });
+    qrLines = String(qr).split("\n").map((l) => "  " + l);
   } catch {
-    qr = "(install the 'qrcode' package in ~/.pi/agent/extensions/pi-remote to show a QR)";
+    qrLines = ["  (install the 'qrcode' package in ~/.pi/agent/extensions/pi-remote to show a QR)"];
   }
-  for (const l of String(qr).split("\n")) lines.push("  " + l);
 
-  lines.push("");
-  lines.push("  Pairing string (copy if the camera is unavailable):");
-  lines.push("  " + payload);
+  // pi cuts a string-array widget off at 10 lines, which chopped the QR in
+  // half. A component isn't limited, but must keep every line within the
+  // terminal width — so the text wraps and the QR is all-or-nothing.
+  const visible = (l: string) => l.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const wrap = (l: string, width: number): string[] => {
+    if (visible(l) <= width) return [l];
+    const out: string[] = [];
+    const room = Math.max(8, width - 2);
+    for (let i = 0; i < l.length; i += room) out.push((i === 0 ? "" : "  ") + l.slice(i, i + room));
+    return out;
+  };
 
-  ctx.ui.setWidget("pi-remote-pair", lines, { position: "above" } as any);
+  const component = {
+    render(width: number): string[] {
+      const out: string[] = [];
+      for (const l of lines) out.push(...wrap(l, width));
+      if (qrLines.every((l) => visible(l) <= width)) out.push(...qrLines);
+      else out.push(...wrap("  (Widen this window to show the QR code, or use the pairing string below.)", width));
+      out.push("");
+      out.push(...wrap("  Pairing string (copy if the camera is unavailable):", width));
+      out.push(...wrap("  " + payload, width));
+      return out;
+    },
+    invalidate(): void {},
+  };
+
+  ctx.ui.setWidget("pi-remote-pair", (() => component) as any, { placement: "aboveEditor" } as any);
 }
 
 function sleep(ms: number): Promise<void> {
